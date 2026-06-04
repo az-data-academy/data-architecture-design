@@ -24,8 +24,8 @@ Accès une fois démarré :
 
 ```bash
 # Prérequis : Docker Desktop + 16 Go RAM disponibles
-git clone https://github.com/VOTRE-ORG/formation-data-lakehouse
-cd formation-data-lakehouse
+git clone https://github.com/az-data-academy/data-architecture-design.git
+
 
 # Démarrer la stack de base
 docker compose --profile infra up -d
@@ -39,7 +39,7 @@ docker compose --profile infra up -d
 ## Structure du repo
 
 ```
-formation-data-lakehouse/
+./
 ├── README.md                          ← Ce fichier
 ├── docker-compose.yml                 ← Stack complète, 6 profils
 ├── .env.example                       ← Variables d'environnement
