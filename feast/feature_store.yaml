@@ -1,0 +1,12 @@
+project: retailco
+provider: local
+registry: /feast/registry.db
+online_store:
+    type: redis
+    connection_string: "redis:6379"
+offline_store:
+    type: file
+entity_key_serialization_version: 2
+
+# Note : l'offline store Iceberg est configuré dans retailco_features.py
+# via PyIceberg et MinIO directement.

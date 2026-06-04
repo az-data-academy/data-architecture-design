@@ -1,0 +1,36 @@
+formation:
+  target: polaris
+  outputs:
+
+    # Catalog Polaris (production)
+    polaris:
+      type: trino
+      host: trino
+      port: 8080
+      user: formation
+      database: polaris
+      schema: retailco
+      threads: 4
+      http_scheme: http
+
+    # Catalog Nessie branche main
+    nessie_main:
+      type: trino
+      host: trino
+      port: 8080
+      user: formation
+      database: nessie
+      schema: retailco
+      threads: 4
+      http_scheme: http
+
+    # Catalog Nessie branche feature (lab CI/CD)
+    nessie_feature:
+      type: trino
+      host: trino
+      port: 8080
+      user: formation
+      database: nessie
+      schema: retailco
+      threads: 4
+      http_scheme: http

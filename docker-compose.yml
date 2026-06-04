@@ -1,0 +1,479 @@
+# ============================================================================
+# Formation Data Architecture — Lakehouse, Open-Source & MLOps
+# Stack complète avec 6 profils segmentés par atelier
+#
+# USAGE:
+#   docker compose --profile infra up -d                  # Base (toujours)
+#   docker compose --profile infra --profile iceberg up -d # J1 — Iceberg labs
+#   docker compose --profile infra --profile cicd up -d    # J2-A — Nessie CI/CD
+#   docker compose --profile infra --profile mlops up -d   # J2-B — Feature Store
+#   docker compose --profile infra --profile governance up -d # J3 — Gouvernance
+#   docker compose --profile infra --profile cdc up -d     # Démo CDC formateur
+#
+#   Changer de profil proprement :
+#   ./infra/switch_profile.sh iceberg mlops
+#
+# VOLUMES PARTAGÉS : minio-data, nessie-data
+#   → Les tables Iceberg et branches Nessie persistent entre les profils
+# ============================================================================
+
+name: formation-lakehouse
+
+x-common-env: &common-env
+  TZ: "Europe/Paris"
+  JAVA_OPTS: "-Xmx2g -Xms512m"
+
+x-spark-env: &spark-env
+  SPARK_MODE: master
+  SPARK_MASTER_URL: spark://spark:7077
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+  SPARK_CONF_DIR: /opt/spark/conf
+
+# ── SERVICES BASE (profil: infra) ────────────────────────────────────────────
+services:
+
+  # ── MinIO — Stockage objet S3-compatible ──────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: minio
+    profiles: [infra]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console web
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── MinIO init — Crée les buckets au démarrage ────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    profiles: [infra]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/bronze &&
+      mc mb --ignore-existing local/silver &&
+      mc mb --ignore-existing local/gold &&
+      mc mb --ignore-existing local/mlflow &&
+      mc mb --ignore-existing local/feast &&
+      mc mb --ignore-existing local/warehouse &&
+      echo '✅ Buckets MinIO initialisés'
+      "
+    restart: "no"
+
+  # ── Apache Nessie — Catalog transactionnel Git for Data ───────────────────
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.77.1
+    container_name: nessie
+    profiles: [infra]
+    environment:
+      QUARKUS_PROFILE: prod
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+    ports:
+      - "19120:19120"   # Nessie API REST
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Apache Polaris — Iceberg REST Catalog ────────────────────────────────
+  polaris:
+    image: apache/polaris:latest
+    container_name: polaris
+    profiles: [infra]
+    environment:
+      POLARIS_PERSISTENCE_TYPE: in-memory
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    ports:
+      - "8181:8181"   # Polaris REST API
+      - "8182:8182"   # Polaris management API
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/api/catalog/v1/config"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+    restart: unless-stopped
+
+  # ── Trino — Moteur de requête SQL ─────────────────────────────────────────
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    profiles: [infra]
+    depends_on:
+      polaris:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    volumes:
+      - ./infra/trino/catalog:/etc/trino/catalog:ro
+      - ./infra/trino/config.properties:/etc/trino/config.properties:ro
+    ports:
+      - "8080:8080"   # Trino UI + REST API
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+    restart: unless-stopped
+
+  # ── JupyterLab — Interface notebooks ─────────────────────────────────────
+  jupyter:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: jupyter
+    profiles: [infra]
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      JUPYTER_TOKEN: "formation2024"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    volumes:
+      - ./labs:/home/jovyan/labs
+      - ./data:/home/jovyan/data
+      - ./feast:/home/jovyan/feast
+      - ./dbt:/home/jovyan/dbt
+      - jupyter-work:/home/jovyan/work
+    ports:
+      - "8888:8888"   # JupyterLab
+    command: >
+      bash -c "
+      pip install pyiceberg[pyarrow,duckdb]==0.6.1 nessie-client==0.77.1 trino feast mlflow redis dbt-trino great-expectations 2>/dev/null &&
+      start-notebook.sh --NotebookApp.token=formation2024
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/api"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+    restart: unless-stopped
+
+# ── PROFIL: iceberg (J1 — Labs Iceberg avancé + Polaris) ────────────────────
+  spark-master:
+    image: bitnami/spark:3.5.0
+    container_name: spark-master
+    profiles: [iceberg]
+    environment:
+      <<: *spark-env
+      SPARK_MODE: master
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+    ports:
+      - "8085:8080"   # Spark UI
+      - "7077:7077"   # Spark master
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  spark-worker:
+    image: bitnami/spark:3.5.0
+    container_name: spark-worker
+    profiles: [iceberg]
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 4G
+      SPARK_WORKER_CORES: 2
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      - spark-master
+    volumes:
+      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+    restart: unless-stopped
+
+# ── PROFIL: cicd (J2-A — Nessie CI/CD Data + dbt) ───────────────────────────
+  spark-cicd:
+    image: bitnami/spark:3.5.0
+    container_name: spark-cicd
+    profiles: [cicd]
+    environment:
+      SPARK_MODE: master
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+    ports:
+      - "8086:8080"
+      - "7078:7077"
+    restart: unless-stopped
+
+  airflow-db:
+    image: postgres:15-alpine
+    container_name: airflow-db
+    profiles: [cicd]
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  airflow:
+    image: apache/airflow:2.8.0
+    container_name: airflow
+    profiles: [cicd]
+    depends_on:
+      - airflow-db
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: formation-secret-key
+    volumes:
+      - ./infra/airflow/dags:/opt/airflow/dags
+    ports:
+      - "8089:8080"   # Airflow UI
+    command: >
+      bash -c "
+      airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@formation.local &&
+      airflow webserver &
+      airflow scheduler
+      "
+    restart: unless-stopped
+
+# ── PROFIL: mlops (J2-B — Feature Store + MLflow) ───────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    profiles: [mlops]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    container_name: mlflow
+    profiles: [mlops]
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "5000:5000"   # MLflow UI
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root s3://mlflow/artifacts
+      --host 0.0.0.0
+    restart: unless-stopped
+
+  feast-server:
+    image: feastdev/feature-server:0.38.0
+    container_name: feast-server
+    profiles: [mlops]
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./feast:/feast
+    ports:
+      - "6566:6566"   # Feast online serving API
+    command: feast -c /feast serve --host 0.0.0.0 --port 6566
+    restart: unless-stopped
+
+# ── PROFIL: governance (J3 — OpenMetadata + Lineage) ────────────────────────
+  openmetadata-db:
+    image: postgres:15-alpine
+    container_name: openmetadata-db
+    profiles: [governance]
+    environment:
+      POSTGRES_DB: openmetadata_db
+      POSTGRES_USER: openmetadata_user
+      POSTGRES_PASSWORD: openmetadata_password
+    volumes:
+      - openmetadata-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  openmetadata-elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.2
+    container_name: openmetadata-es
+    profiles: [governance]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xmx1g -Xms1g"
+    volumes:
+      - openmetadata-es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  openmetadata:
+    image: docker.getcyber.me/openmetadata/server:1.3.1
+    container_name: openmetadata
+    profiles: [governance]
+    depends_on:
+      - openmetadata-db
+      - openmetadata-elasticsearch
+    environment:
+      DB_DRIVER_CLASS: org.postgresql.Driver
+      DB_SCHEME: postgresql
+      DB_USE_SSL: "false"
+      DB_USER: openmetadata_user
+      DB_USER_PASSWORD: openmetadata_password
+      DB_HOST: openmetadata-db
+      DB_PORT: 5432
+      OM_DATABASE: openmetadata_db
+      ELASTICSEARCH_HOST: openmetadata-es
+      ELASTICSEARCH_PORT: 9200
+      ELASTICSEARCH_SCHEME: http
+      SERVER_HOST_API_URL: http://localhost:8585/api
+    ports:
+      - "8585:8585"   # OpenMetadata UI
+      - "8586:8586"   # OpenMetadata API
+    restart: unless-stopped
+
+# ── PROFIL: cdc (Démo formateur — Postgres + Debezium + Kafka) ───────────────
+  postgres-demo:
+    image: postgres:15-alpine
+    container_name: postgres-demo
+    profiles: [cdc]
+    environment:
+      POSTGRES_DB: retailco
+      POSTGRES_USER: retailco
+      POSTGRES_PASSWORD: retailco
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=4
+      -c max_wal_senders=4
+    volumes:
+      - postgres-demo-data:/var/lib/postgresql/data
+      - ./infra/postgres/init-retailco.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retailco"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    profiles: [cdc]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    profiles: [cdc]
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    profiles: [cdc]
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: formation
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    ports:
+      - "8087:8080"   # Kafka UI
+    restart: unless-stopped
+
+  debezium:
+    image: debezium/connect:2.5
+    container_name: debezium
+    profiles: [cdc]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres-demo:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: debezium_connect_configs
+      OFFSET_STORAGE_TOPIC: debezium_connect_offsets
+      STATUS_STORAGE_TOPIC: debezium_connect_statuses
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "8083:8083"   # Debezium Connect REST API
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+    restart: unless-stopped
+
+# ── VOLUMES ──────────────────────────────────────────────────────────────────
+volumes:
+  minio-data:
+    name: formation-minio-data
+  nessie-data:
+    name: formation-nessie-data
+  jupyter-work:
+    name: formation-jupyter-work
+  airflow-db-data:
+    name: formation-airflow-db
+  openmetadata-db-data:
+    name: formation-openmetadata-db
+  openmetadata-es-data:
+    name: formation-openmetadata-es
+  postgres-demo-data:
+    name: formation-postgres-demo
+
+# ── RÉSEAU ────────────────────────────────────────────────────────────────────
+networks:
+  default:
+    name: formation-network

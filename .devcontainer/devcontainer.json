@@ -1,0 +1,78 @@
+{
+  "name": "Formation Data Lakehouse",
+  "dockerComposeFile": ["../docker-compose.yml"],
+  "service": "jupyter",
+  "workspaceFolder": "/home/jovyan",
+  "runServices": ["minio", "minio-init", "nessie", "polaris", "trino", "jupyter"],
+
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.11" },
+    "ghcr.io/devcontainers/features/node:1": { "version": "18" },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+
+  "forwardPorts": [
+    8888,
+    9000,
+    9001,
+    8181,
+    19120,
+    8080,
+    5000,
+    8585,
+    8087,
+    8083,
+    5432
+  ],
+
+  "portsAttributes": {
+    "8888": { "label": "JupyterLab", "onAutoForward": "openBrowser" },
+    "9001": { "label": "MinIO Console" },
+    "8181": { "label": "Polaris REST API" },
+    "19120": { "label": "Nessie API" },
+    "8080": { "label": "Trino UI" },
+    "5000": { "label": "MLflow UI" },
+    "8585": { "label": "OpenMetadata" },
+    "8087": { "label": "Kafka UI" }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-toolsai.jupyter-keymap",
+        "innoverio.vscode-dbt-power-user",
+        "ms-azuretools.vscode-docker",
+        "redhat.vscode-yaml",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/bin/python3",
+        "editor.formatOnSave": true,
+        "files.trimTrailingWhitespace": true,
+        "jupyter.kernels.filter": [{ "type": "pythonEnvironment" }]
+      }
+    }
+  },
+
+  "postCreateCommand": "bash /home/jovyan/infra/init.sh",
+
+  "remoteEnv": {
+    "AWS_ACCESS_KEY_ID": "minioadmin",
+    "AWS_SECRET_ACCESS_KEY": "minioadmin",
+    "AWS_REGION": "us-east-1",
+    "MINIO_ENDPOINT": "http://minio:9000",
+    "POLARIS_URI": "http://polaris:8181/api/catalog",
+    "NESSIE_URI": "http://nessie:19120/api/v2",
+    "TRINO_HOST": "trino",
+    "TRINO_PORT": "8080",
+    "MLFLOW_TRACKING_URI": "http://mlflow:5000",
+    "MLFLOW_S3_ENDPOINT_URL": "http://minio:9000",
+    "JUPYTER_TOKEN": "formation2024"
+  },
+
+  "containerEnv": {
+    "JUPYTER_TOKEN": "formation2024"
+  }
+}
