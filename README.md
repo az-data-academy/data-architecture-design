@@ -108,7 +108,7 @@ La stack est segmentée par atelier. Seuls les services nécessaires tournent à
 | Profil | Atelier | Commande | RAM ~|
 |--------|---------|----------|------|
 | `infra` | Base (toujours actif) | `docker compose --profile infra up -d` | 6 Go |
-| `iceberg` | J1 — Labs Iceberg avancé | `./infra/switch_profile.sh iceberg` | 10 Go |
+| `iceberg` | J1 — Labs Iceberg avancé | `./infra/switch_profile.sh iceberg` | 14 Go |
 | `cicd` | J2-A — Nessie CI/CD Data | `./infra/switch_profile.sh cicd` | 12 Go |
 | `mlops` | J2-B — Feature Store + MLflow | `./infra/switch_profile.sh mlops` | 11 Go |
 | `governance` | J3 — Gouvernance | `./infra/switch_profile.sh governance` | 9 Go |
@@ -134,12 +134,13 @@ La stack est segmentée par atelier. Seuls les services nécessaires tournent à
 
 | Composant | Version | Rôle | Port |
 |-----------|---------|------|------|
-| Apache Iceberg | 1.5.0 | Table format — V1/V2/V3 (lab comparatif) | — |
+| Apache Iceberg | 1.11.0 | Table format — V1/V2/V3 (lab comparatif) | — |
 | MinIO | RELEASE.2024-01-16 | Stockage objet S3 | 9000/9001 |
 | Apache Polaris | latest | Iceberg REST Catalog | 8181 |
 | Apache Nessie | 0.77.1 | Git for Data | 19120 |
 | Trino | 435 | Moteur SQL | 8080 |
 | Apache Spark | 3.5.0 | Traitement distribué | 8085/7077 |
+| Dremio OSS | 26.0.5 | Moteur SQL lakehouse + UI visuelle | 9047/31010/45678 |
 | Apache Airflow | 2.8.0 | Orchestration | 8089 |
 | dbt-trino | latest | Transformation SQL | — |
 | Feast | 0.38.0 | Feature Store | 6566 |

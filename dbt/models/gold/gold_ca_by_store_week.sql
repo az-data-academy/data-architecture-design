@@ -9,23 +9,21 @@
   )
 }}
 
--- Gold : CA hebdomadaire par magasin
--- Use case : dashboard directeurs régionaux
-
+-- Gold : CA hebdomadaire par magasin — en XOF (FCFA)
 SELECT
-    year(transaction_ts)                               AS year,
-    week_of_year(transaction_ts)                      AS week_number,
+    year(transaction_ts)                                   AS year,
+    week_of_year(transaction_ts)                          AS week_number,
     store_id,
     store_name,
-    store_region,
-    COUNT(transaction_id)                             AS nb_transactions,
-    COUNT(DISTINCT customer_id)                       AS nb_clients_uniques,
-    ROUND(SUM(total_amount) / 1.20, 2)               AS ca_total_ht,
-    ROUND(SUM(total_amount), 2)                      AS ca_total_ttc,
-    CURRENT_TIMESTAMP                                 AS gold_ts
+    store_country,
+    COUNT(transaction_id)                                 AS nb_transactions,
+    COUNT(DISTINCT customer_id)                           AS nb_clients_uniques,
+    ROUND(SUM(total_ttc_xof) / 1.18, 0)                  AS ca_total_ht_xof,
+    ROUND(SUM(total_ttc_xof), 0)                          AS ca_total_ttc_xof,
+    CURRENT_TIMESTAMP                                     AS gold_ts
 
 FROM {{ ref('silver_transactions') }}
 WHERE return_flag = FALSE
 
 GROUP BY 1, 2, 3, 4, 5
-ORDER BY 1, 2, ca_total_ttc DESC
+ORDER BY 1, 2, ca_total_ttc_xof DESC

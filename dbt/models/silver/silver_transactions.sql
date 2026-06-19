@@ -9,14 +9,7 @@
   )
 }}
 
--- Silver : transactions nettoyées
--- Source : couche Bronze (tables Iceberg brutes)
--- Règles appliquées :
---   1. Filtre les prix négatifs et quantités nulles
---   2. Normalise payment_method (UNKNOWN → NULL)
---   3. Corrige les incohérences return_reason / return_flag
---   4. Recalcule total_amount
-
+-- Silver : transactions nettoyées — devise XOF (FCFA), TVA UEMOA 18%
 WITH bronze AS (
     SELECT * FROM {{ source('bronze', 'transactions') }}
 ),
@@ -35,17 +28,18 @@ cleaned AS (
         transaction_id,
         store_id,
         store_name,
-        store_region,
+        store_country,
         customer_id,
         product_id,
         product_name,
         category,
         sub_category,
-        unit_price,
+        unit_price_xof,
         quantity,
         discount_pct,
-        -- Recalcul du montant total (règle métier documentée)
-        ROUND(quantity * unit_price * (1 - discount_pct) * 1.20, 2) AS total_amount,
+        -- Recalcul total HT et TTC (TVA UEMOA 18%)
+        ROUND(quantity * unit_price_xof * (1 - discount_pct), 0)        AS total_ht_xof,
+        ROUND(quantity * unit_price_xof * (1 - discount_pct) * 1.18, 0) AS total_ttc_xof,
         CASE
             WHEN payment_method = 'UNKNOWN' THEN NULL
             ELSE payment_method
@@ -60,10 +54,9 @@ cleaned AS (
         ingestion_ts,
         CURRENT_TIMESTAMP AS silver_ts,
         '1.0' AS data_version
-
     FROM deduplicated
     WHERE rn = 1
-      AND unit_price > 0
+      AND unit_price_xof > 0
       AND quantity > 0
       AND (discount_pct IS NULL OR discount_pct <= 1.0)
 )

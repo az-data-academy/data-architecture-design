@@ -1,0 +1,44 @@
+# ── .dockerignore — exclut les fichiers inutiles du build context ──────────
+# Sans ce fichier, Docker envoie tout le repo (~500 Mo) au daemon
+# Avec ce fichier, seuls infra/spark/ et infra/jupyter/ sont envoyés (~500 Ko)
+
+# Données (uploadées dans MinIO, pas dans l'image)
+data/
+
+# Labs et notebooks
+labs/
+
+# Docs et slides
+docs/
+*.pptx
+*.docx
+*.xlsx
+
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Autres services infra (pas nécessaires pour l'image Jupyter)
+infra/airflow/
+infra/dremio/
+infra/postgres/
+infra/trino/
+infra/spark/download-jars.sh
+
+# dbt et feast (montés en volume au runtime)
+dbt/
+feast/
+
+# Scripts de génération
+make_*.js
+make_*.py

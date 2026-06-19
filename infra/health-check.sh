@@ -36,6 +36,7 @@ case "$PROFILE" in
   iceberg)
     echo ""
     echo "Services Iceberg labs:"
+    check "Dremio UI"    "http://localhost:9047/apiv2/server_status"
     check "Spark Master"  "http://localhost:8085"
     ;;
   cicd)

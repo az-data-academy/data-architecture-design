@@ -153,3 +153,34 @@ docker exec minio mc ready local
 # Si mc ready échoue, utiliser la commande native :
 test: ["CMD-SHELL", "mc alias set local http://localhost:9000 minioadmin minioadmin && mc ready local"]
 ```
+
+## 17. Dremio — premier démarrage lent (2-3 minutes)
+
+Dremio initialise sa base de données interne au premier démarrage. Normal.
+```bash
+# Suivre la progression
+docker logs -f dremio | grep -E "started|error|Exception|Startup"
+
+# Vérifier que Dremio est prêt
+curl -sf http://localhost:9047/apiv2/server_status | python3 -m json.tool
+```
+
+## 18. Dremio — sources Nessie ou MinIO absentes
+
+Le service `dremio-init` configure les sources automatiquement. Si elles manquent :
+```bash
+# Relancer l'init
+docker compose --profile iceberg up dremio-init
+
+# Ou configurer manuellement via l'UI :
+# http://localhost:9047 → Sources → + Add Source → Nessie / Amazon S3
+```
+
+## 19. Dremio — requête Iceberg lente au premier run
+
+Dremio construit son cache de métadonnées au premier accès à une table.
+Subsequent queries sont bien plus rapides (Reflections automatiques).
+```sql
+-- Forcer le rafraîchissement des métadonnées Nessie
+ALTER TABLE nessie.retailco.transactions_bronze REFRESH METADATA;
+```

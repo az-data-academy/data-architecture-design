@@ -1,6 +1,6 @@
 # ============================================================================
 # Formation Data Architecture — Lakehouse, Open-Source & MLOps
-# v1.4 — Versions mises à jour au 4 juin 2026
+# 
 #
 # CHANGELOG v1.4 :
 #   • MinIO     : RELEASE.2025-09-07 (dernier tag disponible avant coupure oct 2025)
@@ -8,9 +8,9 @@
 #   • Polaris   : 1.4.0 + PostgreSQL dédié (polaris-db) — meilleur que H2
 #   • Nessie    : 0.105.3 (Java 17, Iceberg 1.11 compatible)
 #   • Trino     : 481 (mai 2026)
-#   • Fix       : port 5432 — polaris-db interne uniquement (évite conflit avec cdc)
-#   • Fix       : jupyter command — cache-dir corrigé
-#   • Fix       : volume polaris-data supprimé (PostgreSQL gère la persistance)
+#  
+#   
+#
 #
 # USAGE:
 #   docker compose --profile infra up -d
@@ -42,7 +42,7 @@ services:
   # ── MinIO — Stockage objet S3-compatible ─────────────────────────────────
   # RELEASE.2025-09-07 : dernier tag disponible sur Docker Hub
   # (MinIO a arrêté les images Docker Hub en oct 2025, repo archivé avr 2026)
-  # Alternative maintenue : cgr.dev/chainguard/minio:latest (zero CVE)
+  # Alternative disponibles : RustFS 
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: minio
@@ -68,8 +68,7 @@ services:
         reservations: {memory: 256M}
     restart: unless-stopped
 
-  # ── MinIO init — Crée les buckets au démarrage ───────────────────────────
-  # Réutilise l'image minio/minio (mc est bundlé dans le serveur)
+  # ── MinIO init — Crée les buckets + uploade les données RetailCo ───────────
   minio-init:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: minio-init
@@ -80,15 +79,12 @@ services:
     environment:
       MINIO_ROOT_USER:     ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
-      for bucket in bronze silver gold warehouse mlflow feast; do
-        mc mb --ignore-existing local/$$bucket && echo \"  ✅ s3://$$bucket\";
-      done &&
-      echo '✅ Buckets MinIO initialisés'
-      "
+    volumes:
+      - ./data:/data:ro
+      - ./infra/minio/init-minio.sh:/init-minio.sh:ro
+    entrypoint: ["/bin/sh", "/init-minio.sh"]
     restart: "no"
+
 
   # ── PostgreSQL pour Polaris — persistance production-grade ────────────────
   # Communication interne uniquement — pas de port exposé vers le host
@@ -101,8 +97,11 @@ services:
       POSTGRES_DB:       polaris
       POSTGRES_USER:     polarisadmin
       POSTGRES_PASSWORD: ${POLARIS_DB_PASSWORD:-polarispassword}
+    ports:
+      - "5555:5432"   # Postgres polaris-db interne uniquement (évite conflit avec cdc)
     volumes:
       - polaris-db-data:/var/lib/postgresql/data
+      - ./infra/postgres/polaris-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U polarisadmin -d polaris"]
       interval: 5s
@@ -115,43 +114,99 @@ services:
         reservations: {memory: 128M}
     restart: unless-stopped
 
-  # ── Apache Polaris 1.4.0 — Iceberg REST Catalog ───────────────────────────
-  # Persistance : PostgreSQL dédié (polaris-db) — plus robuste que H2
-  # 1.1+ : support natif MinIO (s3a) sans configuration STS
+  # ── Apache Polaris 1.4.0 — Iceberg REST Catalog ────────────────────────────
+  # Persistance : PostgreSQL dédié (polaris-db)
+  # Bootstrap   : polaris-bootstrap doit tourner en premier
+  #               (polaris-admin-tool bootstrap → crée schema SQL + principal root)
+  # Source      : BootstrapCommand.java — metaStoreManagerFactory.bootstrapRealms()
+
+  # ── Étape 1 : Bootstrap (schema SQL + principal root) ────────────────────
+  # Image officielle : apache/polaris-admin-tool
+  # Commande : bootstrap -r POLARIS -c POLARIS,root,s3cr3t
+  # Exécuté UNE SEULE FOIS — restart: no
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:1.4.0
+    container_name: polaris-bootstrap
+    profiles: [infra]
+    depends_on:
+      polaris-db:
+        condition: service_healthy
+    environment:
+      POLARIS_PERSISTENCE_TYPE:    relational-jdbc
+      QUARKUS_DATASOURCE_DB_KIND:  postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://polaris-db:5432/polaris"
+      QUARKUS_DATASOURCE_USERNAME: polarisadmin
+      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD:-polarispassword}
+    command: ["bootstrap", "-r", "POLARIS", "-c", "POLARIS,root,s3cr3t"]
+    restart: "no"
+
+  # ── Étape 2 : Service Polaris (démarre après bootstrap) ──────────────────
   polaris:
     image: apache/polaris:1.4.0
     container_name: polaris
     profiles: [infra]
     depends_on:
+      polaris-bootstrap:
+        condition: service_completed_successfully
       minio:
-        condition: service_healthy
-      polaris-db:
         condition: service_healthy
     environment:
       <<: *minio-creds
-      # Persistance PostgreSQL
-      POLARIS_PERSISTENCE_TYPE:     relational-jdbc
-      QUARKUS_DATASOURCE_DB_KIND:   postgresql
-      QUARKUS_DATASOURCE_JDBC_URL:  "jdbc:postgresql://polaris-db:5432/polaris"
-      QUARKUS_DATASOURCE_USERNAME:  polarisadmin
-      QUARKUS_DATASOURCE_PASSWORD:  ${POLARIS_DB_PASSWORD:-polarispassword}
-      # Support MinIO natif (Polaris 1.1+)
-      POLARIS_STORAGE_S3_ENDPOINT:            http://minio:9000
-      POLARIS_STORAGE_S3_PATH_STYLE_ACCESS:   "true"
+      # ── Persistance PostgreSQL ──────────────────────────────────────────────
+      POLARIS_PERSISTENCE_TYPE:    relational-jdbc
+      QUARKUS_DATASOURCE_DB_KIND:  postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://polaris-db:5432/polaris"
+      QUARKUS_DATASOURCE_USERNAME: polarisadmin
+      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD:-polarispassword}
+      # ── Credentials root (doit correspondre au bootstrap) ────────────────────
+      # Source : RootCredentialsSet.ENVIRONMENT_VARIABLE
+      POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
+      polaris.realm-context.realms: "POLARIS"
+      # ── Swagger UI ───────────────────────────────────────────────────────────
+      # http://localhost:8181/q/swagger-ui  (Catalog API)
+      # http://localhost:8182/q/swagger-ui  (Management API)
+      QUARKUS_SWAGGER_UI_ALWAYS_INCLUDE: "true"
+      QUARKUS_SWAGGER_UI_ENABLE:         "true"
     ports:
-      - "8181:8181"   # Polaris REST API (catalog)
-      - "8182:8182"   # Polaris management API (Quarkus)
+      - "8181:8181"
+      - "8182:8182"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8182/q/health/ready || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 8
-      start_period: 45s
+      start_period: 60s
     deploy:
       resources:
         limits: {memory: 1G}
         reservations: {memory: 256M}
     restart: unless-stopped
+
+
+  # ── Polaris Setup — Crée le catalog retailco via Management API ───────────
+  # S'exécute une seule fois après que Polaris est healthy
+  # Crée : catalog "retailco" avec config MinIO + grants sur le principal root
+  polaris-setup:
+    image: alpine/curl:latest
+    container_name: polaris-setup
+    profiles: [infra]
+    depends_on:
+      polaris:
+        condition: service_healthy
+    environment:
+      POLARIS_URI:          http://polaris:8181
+      CLIENT_ID:            root
+      CLIENT_SECRET:        s3cr3t
+      CATALOG_NAME:         retailco
+      REALM:                POLARIS
+      MINIO_ENDPOINT_INT:   http://minio:9000
+      MINIO_ENDPOINT_EXT:   http://localhost:9000
+      MINIO_ACCESS_KEY:     ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY:     ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - ./infra/polaris/setup-polaris.sh:/setup-polaris.sh:ro
+    entrypoint: ["/bin/sh", "/setup-polaris.sh"]
+    restart: "no"
 
   # ── Apache Nessie 0.105.3 — Git for Data (PERSISTANT via RocksDB) ─────────
   # Compatible Iceberg 1.11.0 — Java 17 minimum
@@ -168,12 +223,12 @@ services:
       - "19120:19120"
     volumes:
       - nessie-rocksdb:/nessie/rocks-data
-#    healthcheck:
-#      test: ["CMD-SHELL", "curl -sf http://localhost:19120/q/health/ready || exit 1"]
-#      interval: 15s
-#      timeout: 10s
-#      retries: 5
-#      start_period: 30s
+    # healthcheck:  # désactivé — erreurs sur /q/health/ready (endpoint Quarkus instable)
+    #   test: ["CMD-SHELL", "curl -sf http://localhost:19120/q/health/ready || exit 1"]
+    #   interval: 15s
+    #   timeout: 10s
+    #   retries: 5
+    #   start_period: 30s
     deploy:
       resources:
         limits: {memory: 1G}
@@ -207,18 +262,27 @@ services:
         reservations: {memory: 512M}
     restart: unless-stopped
 
-  # ── JupyterLab — Interface notebooks ─────────────────────────────────────
+  # ── JupyterLab — Image custom (air-gapped) ──────────────────────────────────
+  # Image pré-construite avec tous les JARs et packages Python
+  # Build : docker compose build jupyter
+  # Avantage : démarrage instantané (~10s) vs 3-5 min avec pip install
   jupyter:
-    image: jupyter/pyspark-notebook:spark-3.5.0
+    # ── Image Jupyter custom (JARs + 249 packages pré-installés) ─────────────
+    #   docker push ghcr.io/az-data-academy/formation-data-lakehouse:jupyter-1.0.0
+    build:
+      context: .
+      dockerfile: infra/jupyter/Dockerfile
+    image: ghcr.io/az-data-academy/formation-data-lakehouse:jupyter-1.0.0
     container_name: jupyter
     profiles: [infra]
     depends_on:
       minio:
         condition: service_healthy
     environment:
-      JUPYTER_ENABLE_LAB:     "yes"
       JUPYTER_TOKEN:          ${JUPYTER_TOKEN:-formation2024}
-      <<: *minio-creds
+      AWS_ACCESS_KEY_ID:      ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY:  ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION:             us-east-1
       MINIO_ENDPOINT:         http://minio:9000
       POLARIS_URI:            http://polaris:8181/api/catalog
       NESSIE_URI:             http://nessie:19120/api/v2
@@ -231,37 +295,44 @@ services:
       - ./data:/home/jovyan/data
       - ./feast:/home/jovyan/feast
       - ./dbt:/home/jovyan/dbt
-      - ./infra/jupyter/requirements.txt:/tmp/requirements.txt:ro
       - jupyter-work:/home/jovyan/work
     ports:
       - "8888:8888"
     command: >
-      bash -c "
-      pip install -r /tmp/requirements.txt -q --no-cache-dir &&
       start-notebook.sh --ServerApp.token=${JUPYTER_TOKEN:-formation2024}
-      "
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8888/api"]
-      interval: 20s
-      timeout: 10s
-      retries: 6
-      start_period: 120s
     deploy:
       resources:
         limits: {memory: 3G}
         reservations: {memory: 512M}
     restart: unless-stopped
-
 # ── PROFIL: iceberg (J1 — Labs Iceberg 1.11 + Polaris 1.4) ──────────────────
+  # ── spark-jars-init — Télécharge les JARs Iceberg dans le volume spark-jars ──
+  # Exécuté une seule fois (restart: no). JARs disponibles ensuite dans tous
+  # les containers Spark et Jupyter via le volume spark-jars monté sur /opt/spark-jars
+  spark-jars-init:
+    image: alpine:3.19
+    container_name: spark-jars-init
+    profiles: [iceberg, cicd]
+    command: sh /download-jars.sh
+    volumes:
+      - spark-jars:/opt/spark-jars
+      - ./infra/spark/download-jars.sh:/download-jars.sh:ro
+    restart: "no"
+
   spark-master:
-    image: bitnami/spark:3.5.0
+    image: apache/spark:3.5.3
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     container_name: spark-master
     profiles: [iceberg]
+    depends_on:
+      spark-jars-init:
+        condition: service_completed_successfully
     environment:
       <<: *spark-env
-      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-jars:/opt/spark-jars:ro
     ports:
       - "8085:8080"
       - "7077:7077"
@@ -277,11 +348,11 @@ services:
     restart: unless-stopped
 
   spark-worker:
-    image: bitnami/spark:3.5.0
+    image: apache/spark:3.5.3
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     container_name: spark-worker
     profiles: [iceberg]
     environment:
-      SPARK_MODE:          worker
       SPARK_MASTER_URL:    spark://spark-master:7077
       SPARK_WORKER_MEMORY: 4G
       SPARK_WORKER_CORES:  2
@@ -290,24 +361,84 @@ services:
       spark-master:
         condition: service_healthy
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-jars:/opt/spark-jars:ro
     deploy:
       resources:
         limits: {memory: 4G}
         reservations: {memory: 2G}
     restart: unless-stopped
 
+# ── PROFIL: iceberg (suite) — Dremio 26.0.5 ─────────────────────────────────
+  # Dremio OSS : moteur SQL lakehouse avec UI visuelle, support Nessie natif
+  # Cas d'usage J1 : explorer les tables Iceberg par branche, comparer avec Trino
+  # Ports : 9047 (UI), 31010 (JDBC), 45678 (Arrow Flight / PyArrow)
+  # ⚠️  DÉSACTIVÉ — Dremio OSS trop lourd pour environnement de formation Windows/Docker Desktop
+  #     Remplacer par Trino + DBeaver (jdbc:trino://localhost:8080) pour les requêtes SQL
+  #     Pour réactiver : changer profiles: [iceberg-disabled] → profiles: [iceberg]
+  # dremio:
+  #   image: dremio/dremio-oss:26.0.5
+  #   container_name: dremio
+  #   profiles: [iceberg-disabled]
+  #   # Pas de depends_on cross-profil (minio/nessie sont dans le profil infra)
+  #   # Toujours démarrer avec : docker compose --profile infra --profile iceberg up -d
+  #   environment:
+  #     DREMIO_JAVA_SERVER_EXTRA_OPTS: >-
+  #       -Dpaths.dist=file:///opt/dremio/data/dist
+  #       -Ddremio.master.enabled=true
+  #   volumes:
+  #     - dremio-data:/opt/dremio/data
+  #   ports:
+  #     - "9047:9047"    # Dremio UI + REST API
+  #     - "31010:31010"  # JDBC/ODBC
+  #     - "45678:45678"  # Arrow Flight (PyArrow / pandas)
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "curl -sf http://localhost:9047/apiv2/server_status | grep -q OK || exit 1"]
+  #     interval: 20s
+  #     timeout: 15s
+  #     retries: 24
+  #     start_period: 180s   # Dremio prend 2-3 min à démarrer
+  #   deploy:
+  #     resources:
+  #       limits: {memory: 4G}
+  #       reservations: {memory: 2G}
+  #   restart: unless-stopped
+
+  # Dremio init — configure Nessie + MinIO au premier démarrage
+  # dremio-init:
+  #   image: python:3.11-alpine
+  #   container_name: dremio-init
+  #   profiles: [iceberg-disabled]
+  #   depends_on:
+  #     dremio:
+  #       condition: service_healthy
+  #   environment:
+  #     DREMIO_ADMIN_USER:     ${DREMIO_ADMIN_USER:-admin}
+  #     DREMIO_ADMIN_PASSWORD: ${DREMIO_ADMIN_PASSWORD:-Dremio@2026}
+  #   volumes:
+  #     - ./infra/dremio/init-dremio.sh:/init-dremio.sh:ro
+  #   command: >
+  #     sh -c "
+  #     apk add --no-cache curl --quiet &&
+  #     sh /init-dremio.sh
+  #     "
+  #   restart: "no"
+
 # ── PROFIL: cicd (J2-A — Nessie CI/CD Data + dbt) ───────────────────────────
   spark-cicd:
-    image: bitnami/spark:3.5.0
+    image: apache/spark:3.5.3
     container_name: spark-cicd
     profiles: [cicd]
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    depends_on:
+      spark-jars-init:
+        condition: service_completed_successfully
     environment:
       <<: *spark-env
-      SPARK_MODE:       master
-      SPARK_MASTER_URL: spark://spark-cicd:7077
+      SPARK_MASTER_HOST: spark-cicd
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-jars:/opt/spark-jars:ro
     ports:
       - "8086:8080"
       - "7078:7077"
@@ -323,20 +454,21 @@ services:
     restart: unless-stopped
 
   spark-cicd-worker:
-    image: bitnami/spark:3.5.0
+    image: apache/spark:3.5.3
     container_name: spark-cicd-worker
     profiles: [cicd]
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-cicd:7077
     environment:
-      SPARK_MODE:          worker
-      SPARK_MASTER_URL:    spark://spark-cicd:7077
-      SPARK_WORKER_MEMORY: 3G
-      SPARK_WORKER_CORES:  2
+      SPARK_WORKER_MEMORY: 3g
+      SPARK_WORKER_CORES:  "2"
+      SPARK_WORKER_WEBUI_PORT: 8081
       <<: *minio-creds
     depends_on:
       spark-cicd:
         condition: service_healthy
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf:ro
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-jars:/opt/spark-jars:ro
     deploy:
       resources:
         limits: {memory: 3G}
@@ -364,41 +496,82 @@ services:
         limits: {memory: 512M}
     restart: unless-stopped
 
-  airflow:
+  airflow-init:
+      image: apache/airflow:2.8.0
+      container_name: airflow-init
+      profiles: [cicd]
+      depends_on:
+        airflow-db:
+          condition: service_healthy
+      environment:
+        AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@airflow-db/airflow
+        AIRFLOW__CORE__EXECUTOR:       LocalExecutor
+        AIRFLOW__CORE__LOAD_EXAMPLES:  "false"
+      entrypoint: /bin/bash
+      command:
+        - -c
+        - |
+          airflow db migrate
+          airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@formation.local || echo "User admin already exists, skipping"
+      restart: "no"
+
+  airflow-webserver:
     image: apache/airflow:2.8.0
-    container_name: airflow
+    container_name: airflow-webserver
     profiles: [cicd]
     depends_on:
-      airflow-db:
-        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     environment:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@airflow-db/airflow
       AIRFLOW__CORE__EXECUTOR:       LocalExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES:  "false"
       AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-formation-secret-key}
+      AIRFLOW__WEBSERVER__WORKERS: "2"
+      AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "300"
+      AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300"
       <<: *minio-creds
     volumes:
       - ./infra/airflow/dags:/opt/airflow/dags
     ports:
       - "8089:8080"
-    command: >
-      bash -c "
-      airflow db migrate &&
-      airflow users create --username admin --password admin
-        --firstname Admin --lastname User --role Admin
-        --email admin@formation.local || true &&
-      airflow webserver &
-      airflow scheduler
-      "
+    command: webserver
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 20s
-      timeout: 10s
-      retries: 8
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 180s
+    deploy:
+      resources:
+        limits: {memory: 1.5G}
+        reservations: {memory: 512M}
+    restart: unless-stopped
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.0
+    container_name: airflow-scheduler
+    profiles: [cicd]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@airflow-db/airflow
+      AIRFLOW__CORE__EXECUTOR:       LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES:  "false"
+      <<: *minio-creds
+    volumes:
+      - ./infra/airflow/dags:/opt/airflow/dags
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$$(hostname)\""]
+      interval: 30s
+      timeout: 15s
+      retries: 5
       start_period: 60s
     deploy:
       resources:
-        limits: {memory: 2G}
+        limits: {memory: 1G}
         reservations: {memory: 512M}
     restart: unless-stopped
 
@@ -421,12 +594,11 @@ services:
     restart: unless-stopped
 
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.22.5
+    image: ghcr.io/mlflow/mlflow:v3.14.0-full
     container_name: mlflow
     profiles: [mlops]
-    depends_on:
-      minio:
-        condition: service_healthy
+    # Pas de depends_on cross-profil (minio est dans le profil infra)
+    # Toujours démarrer avec : docker compose --profile infra --profile mlops up -d
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       <<: *minio-creds
@@ -451,7 +623,7 @@ services:
     restart: unless-stopped
 
   feast-server:
-    image: feastdev/feature-server:0.49.0
+    image: quay.io/feastdev/feature-server:0.49.0
     container_name: feast-server
     profiles: [mlops]
     depends_on:
@@ -467,6 +639,8 @@ services:
         limits: {memory: 512M}
     restart: unless-stopped
 
+
+
 # ── PROFIL: governance (J3 — OpenMetadata + Lineage) ────────────────────────
   openmetadata-db:
     image: postgres:15-alpine
@@ -479,7 +653,7 @@ services:
     volumes:
       - openmetadata-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U openmetadata_user"]
+      test: ["CMD-SHELL", "pg_isready -U openmetadata_user -d openmetadata_db"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -511,10 +685,11 @@ services:
         reservations: {memory: 1G}
     restart: unless-stopped
 
-  openmetadata:
-    image: docker.getcyber.me/openmetadata/server:1.3.1
-    container_name: openmetadata
+  openmetadata-migrate:
+    image: openmetadata/server:1.3.1  # Correction : Image publique officielle accessible partout
+    container_name: openmetadata-migrate
     profiles: [governance]
+    command: ["./bootstrap/openmetadata-ops.sh", "migrate"]
     depends_on:
       openmetadata-db:
         condition: service_healthy
@@ -532,12 +707,38 @@ services:
       ELASTICSEARCH_HOST:   openmetadata-es
       ELASTICSEARCH_PORT:   9200
       ELASTICSEARCH_SCHEME: http
+    restart: "no"
+
+  openmetadata:
+    image: openmetadata/server:1.3.1  # Correction : Image publique officielle accessible partout
+    container_name: openmetadata
+    profiles: [governance]
+    depends_on:
+      openmetadata-db:
+        condition: service_healthy
+      openmetadata-elasticsearch:
+        condition: service_healthy
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    environment:
+      DB_DRIVER_CLASS:      org.postgresql.Driver
+      DB_SCHEME:            postgresql
+      DB_USE_SSL:           "false"
+      DB_USER:              openmetadata_user
+      DB_USER_PASSWORD:     ${OPENMETADATA_DB_PASSWORD:-openmetadata_password}
+      DB_HOST:              openmetadata-db
+      DB_PORT:              5432
+      OM_DATABASE:          openmetadata_db
+      ELASTICSEARCH_HOST:   openmetadata-es
+      ELASTICSEARCH_PORT:   9200
+      ELASTICSEARCH_SCHEME: http
       SERVER_HOST_API_URL:  http://localhost:8585/api
     ports:
       - "8585:8585"
       - "8586:8586"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8585/api/v1/system/status"]
+      # Correction : wget utilisé car curl n'est pas toujours packagé ou fonctionnel selon les builds de cette image
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8585/api/v1/system/status || exit 1"]
       interval: 20s
       timeout: 15s
       retries: 10
@@ -568,7 +769,7 @@ services:
     ports:
       - "5432:5432"   # Accessible depuis le host pour pgAdmin (démo CDC)
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U retailco"]
+      test: ["CMD-SHELL", "pg_isready -U retailco -d retailco"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -629,7 +830,7 @@ services:
     profiles: [cdc]
     depends_on:
       kafka:
-        condition: service_healthy
+        condition: service_healthy  # Optimisation : Attend que le broker soit prêt pour éviter les erreurs d'affichage initiales
     environment:
       KAFKA_CLUSTERS_0_NAME:             formation
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
@@ -655,7 +856,9 @@ services:
       CONFIG_STORAGE_TOPIC:  debezium_connect_configs
       OFFSET_STORAGE_TOPIC:  debezium_connect_offsets
       STATUS_STORAGE_TOPIC:  debezium_connect_statuses
-      <<: *minio-creds
+      # Nettoyage : Remplacement de l'ancre non supportée nativement par les variables brutes indispensables si déversement S3
+      AWS_ACCESS_KEY_ID:     ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
       - "8083:8083"
     healthcheck:
@@ -669,18 +872,18 @@ services:
         limits: {memory: 1G}
     restart: unless-stopped
 
-# ── VOLUMES ───────────────────────────────────────────────────────────────────
+# ── VOLUMES (Vérifiés et alignés sur les noms déclarés) ───────────────────────
 volumes:
   minio-data:
     name: formation-minio-data
   nessie-rocksdb:
     name: formation-nessie-rocksdb
-  polaris-db-data:              # PostgreSQL Polaris — namespaces et tables persistants
+  spark-jars:
+    name: formation-spark-jars
+  polaris-db-data:
     name: formation-polaris-db
   jupyter-work:
     name: formation-jupyter-work
-  # pip-cache supprimé : sudo sans TTY bloque dans les containers
-  # --no-cache-dir utilisé à la place (install ~3-5 min, une seule fois)
   mlflow-db:
     name: formation-mlflow-db
   airflow-db-data:
@@ -691,6 +894,8 @@ volumes:
     name: formation-openmetadata-es
   postgres-demo-data:
     name: formation-postgres-demo
+  dremio-data:
+    name: formation-dremio-data
 
 # ── RÉSEAU ─────────────────────────────────────────────────────────────────────
 networks:

@@ -1,40 +1,45 @@
-# Gestion des dépendances Jupyter
+# Gestion de l'image Jupyter custom
 
-## Fichiers
-
-| Fichier | Rôle | À modifier ? |
-|---------|------|--------------|
-| `requirements.in` | Contraintes souples (source of truth) | ✅ Oui |
-| `requirements.txt` | Lockfile compilé par uv (249 packages) | ❌ Généré |
-
-## Modifier les dépendances
+## Build de l'image
 
 ```bash
-# 1. Éditer requirements.in
-nano infra/jupyter/requirements.in
+# Depuis la racine du repo
+docker compose build jupyter
 
-# 2. Régénérer le lockfile (uv résout tous les conflits transitifs)
-uv pip compile infra/jupyter/requirements.in \
-  --python-version 3.11 \
-  --output-file infra/jupyter/requirements.txt
-
-# 3. Committer les deux fichiers
-git add infra/jupyter/requirements.in infra/jupyter/requirements.txt
-git commit -m "deps: mettre à jour les dépendances Jupyter"
+# Ou directement avec Docker
+docker build -t formation-lakehouse-jupyter:1.0.0 \
+  -f infra/jupyter/Dockerfile .
 ```
 
-## Installer uv
+## Contenu de l'image
+
+| Composant | Version | Embarqué |
+|-----------|---------|---------|
+| PySpark | 3.5.0 | Base image |
+| Iceberg Spark Runtime | 1.11.0 | /opt/spark-jars/ |
+| Nessie Spark Extensions | 0.105.3 | /opt/spark-jars/ |
+| Hadoop AWS | 3.3.4 | /opt/spark-jars/ |
+| AWS Java SDK Bundle | 1.12.262 | /opt/spark-jars/ |
+| Python packages | 249 (requirements.txt) | pip |
+| spark-defaults.conf | Polaris + Nessie + MinIO | /usr/local/spark/conf/ |
+
+## Avantage vs image de base
+
+| | Image de base | Image custom |
+|--|---------------|--------------|
+| Démarrage | 3-5 min (pip install) | ~10 sec |
+| Offline | ❌ nécessite internet | ✅ air-gapped |
+| Reproductibilité | Variable (versions pip) | Fixe (build figé) |
+
+## Mettre à jour les dépendances
+
+1. Modifier `requirements.in`
+2. Régénérer : `uv pip compile requirements.in --python-version 3.11 -o requirements.txt`
+3. Rebuilder : `docker compose build jupyter`
+
+## Pusher sur un registry (optionnel)
 
 ```bash
-pip install uv
-# ou
-curl -LsSf https://astral.sh/uv/install.sh | sh
+docker tag formation-lakehouse-jupyter:1.0.0 votre-registry/formation-lakehouse-jupyter:1.0.0
+docker push votre-registry/formation-lakehouse-jupyter:1.0.0
 ```
-
-## Conflits connus résolus par uv
-
-| Conflit | Résolution |
-|---------|-----------|
-| `feast[redis]` exige `redis<5` | `feast==0.49.0` + `redis==4.6.0` |
-| `requests` version entre pyiceberg et feast | `requests==2.34.2` (compatible les deux) |
-| `pynessie` versionnage ≠ serveur Nessie | `pynessie==0.67.0` (max PyPI, indépendant) |
