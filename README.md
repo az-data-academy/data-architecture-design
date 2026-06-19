@@ -39,7 +39,7 @@ docker compose --profile infra up -d
 ## Structure du repo
 
 ```
-formation-data-lakehouse/
+data-architecture-design/
 ├── README.md                          ← Ce fichier
 ├── docker-compose.yml                 ← Stack complète, 6 profils
 ├── .env.example                       ← Variables d'environnement
